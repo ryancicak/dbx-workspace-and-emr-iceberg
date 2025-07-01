@@ -18,3 +18,19 @@ allowed_ssh_cidr_blocks = ["<your.ip.address.here/32>"]
 release_label = "emr-7.9.0"
 applications  = ["Spark"]
 databricks_uc_aws_account_id = "<yourdatabricksaccount_id>"
+```
+
+If you'd like to connect your existing EMR cluster to UC's IRC, you can use the following (swapping out cicak_catalog for your catalog name, uri for your workspace, and oauth client_id and client_secret):
+```hcl
+spark-sql \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.1,org.apache.iceberg:iceberg-aws-bundle:1.9.1 \
+  --conf spark.sql.catalog.cicak_catalog=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.cicak_catalog.type=rest \
+  --conf spark.sql.catalog.cicak_catalog.rest.auth.type=oauth2 \
+  --conf spark.sql.catalog.cicak_catalog.uri=https://dbc-fa9f7482-be8e.cloud.databricks.com/api/2.1/unity-catalog/iceberg-rest \
+  --conf spark.sql.catalog.cicak_catalog.oauth2-server-uri=https://dbc-fa9f7482-be8e.cloud.databricks.com/oidc/v1/token \
+  --conf spark.sql.catalog.cicak_catalog.credential=${databricks_client_id}:${databricks_client_secret} \
+  --conf spark.sql.catalog.cicak_catalog.warehouse=cicak_catalog \
+  --conf spark.sql.catalog.cicak_catalog.scope=all-apis \
+  --conf spark.sql.defaultCatalog=cicak_catalog
+```
