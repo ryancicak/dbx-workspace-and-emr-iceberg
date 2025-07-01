@@ -1,6 +1,5 @@
 variable "region" {
   type        = string
-  default     = "eu-west-1"  # Set your default AWS region here
   description = "AWS region where resources will be deployed"
 }
 
@@ -27,7 +26,6 @@ variable "cidr_block" {
 variable "prefix" {
   description = "Prefix for resource names"
   type        = string
-  default     = "cicak"  # Set your default prefix
 }
 
 variable "tags" {
