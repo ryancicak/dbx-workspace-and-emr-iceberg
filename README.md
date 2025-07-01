@@ -2,7 +2,7 @@
 Spin-up a Databricks Workspace (with UC Catalog) + EMR Spark, to read/write UC Managed Iceberg tables. EMR Spark is reading/writing to UC via Iceberg Rest Catalog.
 
 
-Add a terraform.tfvars with the following (<CHANGE>):
+Add a terraform.tfvars with the following (<change to your values>):
 ```hcl
 client_id             = "<oauth_serviceprincipal_yourclidentid>"
 client_secret         = "<oauth_serviceprincipal_yourclientsecret>"
