@@ -3,6 +3,7 @@ Spin-up a Databricks Workspace (with UC Catalog) + EMR Spark, to read/write UC M
 
 
 Add a terraform.tfvars with the following (<CHANGE>):
+```hcl
 client_id             = "<oauth_serviceprincipal_yourclidentid>"
 client_secret         = "<oauth_serviceprincipal_yourclientsecret>"
 databricks_account_id = "<yourdatabricksaccountuuid>"
