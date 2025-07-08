@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# Remove any // 
+sed -i "" -E '/arn:aws:iam::\${data.aws_caller_identity.current.account_id}:role\/\${var.prefix}-crossaccount/s|^([[:space:]]*,?[[:space:]]*)//+|\1|' main.tf
+
+terraform init
+
 # Step 1: Comment out the self-referencing line
 sed -i "" '/"arn:aws:iam::${data.aws_caller_identity.current.account_id}:role\/${var.prefix}-crossaccount"/s/^/\/\//' main.tf
 
