@@ -38,27 +38,6 @@ provider "databricks" {
   client_id     = var.client_id
   client_secret = var.client_secret
 }
-resource "aws_security_group" "emr_service_access" {
-  name        = "${var.prefix}-emr-service-access-sg"
-  description = "EMR Service Access Security Group"
-  vpc_id      = data.aws_vpc.workspace.id
-
-  ingress {
-    from_port                = 9443
-    to_port                  = 9443
-    protocol                 = "tcp"
-    security_groups          = [aws_security_group.emr.id]
-    description              = "Allow EMR master node to communicate with service access group"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
-  }
-}
 resource "aws_security_group" "emr" {
   name        = "${var.prefix}-emr-sg"
   description = "Security group for EMR cluster"
@@ -71,7 +50,6 @@ resource "aws_security_group" "emr" {
     self        = true
     description = "Allow all traffic within the security group"
   }
-
   ingress {
     from_port   = 22
     to_port     = 22
@@ -79,7 +57,21 @@ resource "aws_security_group" "emr" {
     cidr_blocks = var.allowed_ssh_cidr_blocks
     description = "SSH access"
   }
+  ingress {
+    from_port   = 9443
+    to_port     = 9443
+    protocol    = "tcp"
+    cidr_blocks = [data.aws_vpc.workspace.cidr_block]
+    description = "Allow EMR internal communication (9443)"
+  }
 
+  ingress {
+    from_port   = 8443
+    to_port     = 8443
+    protocol    = "tcp"
+    cidr_blocks = [data.aws_vpc.workspace.cidr_block]
+    description = "Allow EMR internal communication (8443)"
+  }
   egress {
     from_port   = 0
     to_port     = 0
@@ -528,7 +520,6 @@ ec2_attributes {
     emr_managed_master_security_group = aws_security_group.emr.id
     emr_managed_slave_security_group  = aws_security_group.emr.id
     instance_profile                  = aws_iam_instance_profile.emr_ec2_profile.name
-    service_access_security_group     = aws_security_group.emr_service_access.id
   }
   service_role = aws_iam_role.emr_service_role.name
 
