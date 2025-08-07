@@ -43,10 +43,52 @@ provider "databricks" {
   client_secret = var.client_secret
 }
 
+data "aws_caller_identity" "current" {}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+resource "aws_vpc" "emr" {
+  cidr_block           = "10.0.0.0/16"  # Choose a non-conflicting CIDR; adjust if needed
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  tags                 = merge(var.tags, { Name = "${var.prefix}-emr-vpc" })
+}
+
+resource "aws_internet_gateway" "emr" {
+  vpc_id = aws_vpc.emr.id
+  tags   = merge(var.tags, { Name = "${var.prefix}-emr-igw" })
+}
+
+resource "aws_subnet" "emr" {
+  vpc_id                  = aws_vpc.emr.id
+  cidr_block              = "10.0.0.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = true
+  tags                    = merge(var.tags, { Name = "${var.prefix}-emr-subnet" })
+}
+
+resource "aws_route_table" "emr" {
+  vpc_id = aws_vpc.emr.id
+  tags   = merge(var.tags, { Name = "${var.prefix}-emr-rt" })
+}
+
+resource "aws_route" "internet_access" {
+  route_table_id         = aws_route_table.emr.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.emr.id
+}
+
+resource "aws_route_table_association" "emr" {
+  subnet_id      = aws_subnet.emr.id
+  route_table_id = aws_route_table.emr.id
+}
+
 resource "aws_security_group" "emr" {
   name        = "${var.prefix}-emr-sg"
   description = "Security group for EMR cluster"
-  vpc_id      = data.aws_vpc.workspace.id
+  vpc_id      = aws_vpc.emr.id
 
   ingress {
     from_port   = 0
@@ -68,7 +110,7 @@ resource "aws_security_group" "emr" {
     from_port   = 9443
     to_port     = 9443
     protocol    = "tcp"
-    cidr_blocks = [data.aws_vpc.workspace.cidr_block]
+    cidr_blocks = [aws_vpc.emr.cidr_block]
     description = "Allow EMR internal communication (9443)"
   }
 
@@ -76,7 +118,7 @@ resource "aws_security_group" "emr" {
     from_port   = 8443
     to_port     = 8443
     protocol    = "tcp"
-    cidr_blocks = [data.aws_vpc.workspace.cidr_block]
+    cidr_blocks = [aws_vpc.emr.cidr_block]
     description = "Allow EMR internal communication (8443)"
   }
 
@@ -92,7 +134,7 @@ resource "aws_security_group" "emr" {
 resource "aws_security_group" "emr_service_access" {
   name        = "${var.prefix}-emr-service-access-sg"
   description = "EMR service access security group for private subnet"
-  vpc_id      = data.aws_vpc.workspace.id
+  vpc_id      = aws_vpc.emr.id
 
   ingress {
     from_port       = 9443
@@ -106,23 +148,17 @@ resource "aws_security_group" "emr_service_access" {
     from_port   = 8443
     to_port     = 8443
     protocol    = "tcp"
-    cidr_blocks = [data.aws_vpc.workspace.cidr_block]
+    cidr_blocks = [aws_vpc.emr.cidr_block]
   }
 
   egress {
     from_port   = 9443
     to_port     = 9443
     protocol    = "tcp"
-    cidr_blocks = [data.aws_vpc.workspace.cidr_block]
+    cidr_blocks = [aws_vpc.emr.cidr_block]
   }
 
   tags = var.tags
-}
-
-data "aws_caller_identity" "current" {}
-
-data "aws_availability_zones" "available" {
-  state = "available"
 }
 
 resource "random_id" "suffix" {
@@ -529,35 +565,6 @@ resource "databricks_grants" "schema_grants" {
   depends_on = [databricks_schema.default_schema]
 }
 
-# EMR
-data "aws_vpcs" "all" {}
-
-data "aws_vpc" "workspace" {
-  id = data.aws_vpcs.all.ids[0]
-}
-
-data "aws_subnets" "workspace" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.workspace.id]
-  }
-}
-
-data "aws_subnet" "workspace" {
-  id = data.aws_subnets.workspace.ids[0]
-}
-
-data "aws_security_groups" "workspace" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.workspace.id]
-  }
-}
-
-data "aws_security_group" "workspace" {
-  id = data.aws_security_groups.workspace.ids[0]
-}
-
 resource "aws_emr_cluster" "spark_unity_catalog" {
   name          = "${var.prefix}-emr-spark-uc"
   release_label = var.release_label
@@ -565,7 +572,7 @@ resource "aws_emr_cluster" "spark_unity_catalog" {
 
   ec2_attributes {
     key_name                          = "${var.prefix}_key"
-    subnet_id                         = data.aws_subnet.workspace.id
+    subnet_id                         = aws_subnet.emr.id
     emr_managed_master_security_group = aws_security_group.emr.id
     emr_managed_slave_security_group  = aws_security_group.emr.id
     instance_profile                  = aws_iam_instance_profile.emr_ec2_profile.name
@@ -609,4 +616,7 @@ resource "aws_emr_cluster" "spark_unity_catalog" {
       }
     }
   ])
+
+  depends_on = [aws_route.internet_access]
 }
+
