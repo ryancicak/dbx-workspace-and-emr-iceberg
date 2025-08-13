@@ -26,7 +26,7 @@ tags = {
 region = "<us-east-2>”
 allowed_ssh_cidr_blocks = ["<your.ip.address.here/32>"]
 release_label = "emr-7.9.0"
-applications  = ["Spark"] #Or include "Trino"
+applications  = ["Trino"] #Or include "Spark"
 databricks_uc_aws_account_id = "<yourdatabricksaccount_id>"
 ```
 
