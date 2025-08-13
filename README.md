@@ -1,5 +1,5 @@
 # dbx-workspace-and-emr-iceberg
-Spin-up a Databricks Workspace (with UC Catalog) + EMR Spark, to read/write UC Managed Iceberg tables. EMR Spark is reading/writing to UC via Iceberg Rest Catalog.
+Spin-up a Databricks Workspace (with UC Catalog) + EMR Spark or EMR Trino, to read/write UC Managed Iceberg tables. EMR Spark or EMR Trino is reading/writing to UC via Iceberg Rest Catalog.
 
 Pre-req:<br>
 #1) You MUST have an EC2 key pair with `<yourprefix>_key` (EMR will use this key pair and if one does not exist, EMR will NOT start up)
@@ -26,7 +26,7 @@ tags = {
 region = "<us-east-2>”
 allowed_ssh_cidr_blocks = ["<your.ip.address.here/32>"]
 release_label = "emr-7.9.0"
-applications  = ["Spark"]
+applications  = ["Spark"] #Or include "Trino"
 databricks_uc_aws_account_id = "<yourdatabricksaccount_id>"
 ```
 
@@ -43,4 +43,9 @@ spark-sql \
   --conf spark.sql.catalog.cicak_catalog.warehouse=cicak_catalog \
   --conf spark.sql.catalog.cicak_catalog.scope=all-apis \
   --conf spark.sql.defaultCatalog=cicak_catalog
+```
+
+On your Trino coordinator node, run the following command to immediately start interacting with the Unity Catalog Iceberg REST Catalog:
+```hcl
+/usr/lib/trino/bin/trino-cli-467.amzn.2-executable --server http://localhost:8889 --catalog iceberg
 ```
