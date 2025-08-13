@@ -27,6 +27,7 @@ locals {
   prefix = var.prefix
 }
 
+# Databricks account-level provider for multi-workspace services
 provider "databricks" {
   alias         = "account"
   host          = "https://accounts.cloud.databricks.com"
@@ -35,6 +36,7 @@ provider "databricks" {
   client_secret = var.client_secret
 }
 
+# Workspace-level provider uses the workspace URL once created
 provider "databricks" {
   alias         = "workspace"
   host          = databricks_mws_workspaces.workspace.workspace_url
@@ -44,13 +46,12 @@ provider "databricks" {
 }
 
 data "aws_caller_identity" "current" {}
-
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
 resource "aws_vpc" "emr" {
-  cidr_block           = "10.0.0.0/16"  # Choose a non-conflicting CIDR; adjust if needed
+  cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
   tags                 = merge(var.tags, { Name = "${var.prefix}-emr-vpc" })
@@ -85,11 +86,71 @@ resource "aws_route_table_association" "emr" {
   route_table_id = aws_route_table.emr.id
 }
 
+# Security group for VPC endpoints
+resource "aws_security_group" "vpc_endpoints" {
+  name        = "${var.prefix}-vpc-endpoints-sg"
+  description = "Security group for VPC endpoints"
+  vpc_id      = aws_vpc.emr.id
+
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.emr.id]
+    description     = "HTTPS from EMR security group"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound traffic"
+  }
+
+  tags = merge(var.tags, { Name = "${var.prefix}-vpc-endpoints-sg" })
+}
+
+# VPC Endpoints for SSM (required for SSM to work reliably)
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id              = aws_vpc.emr.id
+  service_name        = "com.amazonaws.${var.region}.ssm"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.emr.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  private_dns_enabled = true
+  
+  tags = merge(var.tags, { Name = "${var.prefix}-ssm-endpoint" })
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id              = aws_vpc.emr.id
+  service_name        = "com.amazonaws.${var.region}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.emr.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  private_dns_enabled = true
+  
+  tags = merge(var.tags, { Name = "${var.prefix}-ssmmessages-endpoint" })
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id              = aws_vpc.emr.id
+  service_name        = "com.amazonaws.${var.region}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.emr.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  private_dns_enabled = true
+  
+  tags = merge(var.tags, { Name = "${var.prefix}-ec2messages-endpoint" })
+}
+
 resource "aws_security_group" "emr" {
   name        = "${var.prefix}-emr-sg"
   description = "Security group for EMR cluster"
   vpc_id      = aws_vpc.emr.id
 
+  # Allow unrestricted intra-SG traffic
   ingress {
     from_port   = 0
     to_port     = 0
@@ -98,6 +159,7 @@ resource "aws_security_group" "emr" {
     description = "Allow all traffic within the security group"
   }
 
+  # SSH access from allowed CIDRs
   ingress {
     from_port   = 22
     to_port     = 22
@@ -106,6 +168,7 @@ resource "aws_security_group" "emr" {
     description = "SSH access"
   }
 
+  # EMR internal ports for Trino and Spark
   ingress {
     from_port   = 9443
     to_port     = 9443
@@ -122,6 +185,15 @@ resource "aws_security_group" "emr" {
     description = "Allow EMR internal communication (8443)"
   }
 
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTPS outbound"
+  }
+
+  # Allow all outbound traffic
   egress {
     from_port   = 0
     to_port     = 0
@@ -192,16 +264,129 @@ resource "databricks_group_member" "owner_is_admin" {
   member_id = databricks_user.owner.id
 }
 
-# IAM Role (Trust)
+resource "databricks_token" "emr_pat" {
+  provider = databricks.workspace
+  comment  = "${var.prefix}-emr-trino-pat"
+  lifetime_seconds = 0
+  depends_on = [databricks_mws_workspaces.workspace]
+}
+
+# Simple cleanup script that runs locally on each node
+resource "aws_s3_object" "simple_trino_cleanup_script" {
+  bucket = aws_s3_bucket.root_storage_bucket.bucket
+  key    = "${var.prefix}/scripts/simple_trino_cleanup.sh"
+  content = <<-EOF
+#!/bin/bash
+# simple_trino_cleanup.sh
+# Removes unwanted properties from iceberg.properties and disables hive.properties
+# Run this script on each EMR node individually
+set -euo pipefail
+
+PROPERTIES_FILE="/etc/trino/conf/catalog/iceberg.properties"
+HIVE_CAT_FILE="/etc/trino/conf/catalog/hive.properties"
+
+HOSTNAME="$(hostname)"
+echo "Starting Trino cleanup on $HOSTNAME..."
+
+# 1) Clean up iceberg.properties - remove the two unwanted properties
+if [[ -f "$PROPERTIES_FILE" ]]; then
+    echo "✓ Found $PROPERTIES_FILE, cleaning up..."
+    
+    # Remove the two problematic lines
+    sudo sed -i '/^fs\.hadoop\.enabled/d' "$PROPERTIES_FILE"
+    sudo sed -i '/^hive\.metastore\.uri/d' "$PROPERTIES_FILE"
+    
+    echo "✓ Removed fs.hadoop.enabled and hive.metastore.uri properties"
+else
+    echo "✗ $PROPERTIES_FILE not found on this node"
+fi
+
+# 2) Disable hive catalog by renaming the file
+if [[ -f "$HIVE_CAT_FILE" ]]; then
+    echo "✓ Found $HIVE_CAT_FILE, disabling..."
+    sudo mv "$HIVE_CAT_FILE" "$${HIVE_CAT_FILE}.disabled"
+    echo "✓ Disabled hive catalog"
+else
+    echo "- No hive catalog file found (already disabled or not present)"
+fi
+
+# 3) Restart Trino to apply changes
+echo "Restarting Trino service..."
+if sudo systemctl restart trino-server || sudo systemctl restart trino-server.service; then
+    echo "✓ Trino restarted successfully"
+else
+    echo "✗ Failed to restart Trino"
+    exit 1
+fi
+
+echo "✓ Cleanup complete on $HOSTNAME!"
+EOF
+  content_type = "text/x-shellscript"
+}
+
+# SSM script that runs the simple cleanup on all nodes
+resource "aws_s3_object" "simple_ssm_script" {
+  bucket = aws_s3_bucket.root_storage_bucket.bucket
+  key    = "${var.prefix}/scripts/simple_ssm.sh"
+  content = <<-EOF
+#!/bin/bash
+# minimal_ssm_cleanup.sh
+set -euo pipefail
+
+# Auto-detect cluster ID
+CLUSTER_ID="$(sed -n 's/.*"jobFlowId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /mnt/var/lib/info/job-flow.json)"
+
+# Get all instance IDs
+ALL_INSTANCES=$(aws emr list-instances --cluster-id "$CLUSTER_ID" --query 'Instances[].Ec2InstanceId' --output text)
+
+# Run cleanup on all nodes via SSM
+aws ssm send-command \
+  --instance-ids $ALL_INSTANCES \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["chmod +x /tmp/simple_trino_cleanup.sh","bash /tmp/simple_trino_cleanup.sh"]'
+
+echo "Cleanup commands sent to all nodes!"
+EOF
+  content_type = "text/x-shellscript"
+}
+
+# Bootstrap script to configure SSM and place the simple cleanup script
+resource "aws_s3_object" "bootstrap_script" {
+  bucket = aws_s3_bucket.root_storage_bucket.bucket
+  key    = "${var.prefix}/scripts/bootstrap.sh"
+  content = <<-EOF
+#!/bin/bash
+# bootstrap.sh - Configure SSM and place cleanup script
+set -euo pipefail
+
+echo "Configuring SSM Agent..."
+
+# Restart SSM agent to ensure it's running with current IAM role
+sudo systemctl restart amazon-ssm-agent
+sudo systemctl enable amazon-ssm-agent
+
+echo "Downloading simple cleanup script..."
+
+# Download the simple cleanup script to /tmp/
+aws s3 cp s3://${aws_s3_bucket.root_storage_bucket.bucket}/${aws_s3_object.simple_trino_cleanup_script.key} /tmp/simple_trino_cleanup.sh
+chmod +x /tmp/simple_trino_cleanup.sh
+
+echo "Bootstrap complete"
+EOF
+  content_type = "text/x-shellscript"
+}
+
 resource "aws_iam_role" "emr_service_role" {
   name = "${var.prefix}-emr-service-role"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "elasticmapreduce.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = { Service = "elasticmapreduce.amazonaws.com" },
+        Action = "sts:AssumeRole"
+      }
+    ]
   })
 }
 
@@ -213,30 +398,54 @@ resource "aws_iam_role_policy_attachment" "emr_service_role_policy" {
 resource "aws_iam_role" "emr_ec2_role" {
   name = "${var.prefix}-emr-ec2-role"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = { Service = "ec2.amazonaws.com" },
+        Action = "sts:AssumeRole"
+      }
+    ]
   })
 }
 
+# Attach the default EMR EC2 policy
+resource "aws_iam_role_policy_attachment" "emr_ec2_instance_profile" {
+  role       = aws_iam_role.emr_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role"
+}
+
+# Attach SSM managed instance policy
+resource "aws_iam_role_policy_attachment" "emr_ec2_ssm_managed_instance" {
+  role       = aws_iam_role.emr_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Custom policy for additional permissions including SSM commands
 resource "aws_iam_role_policy" "emr_ec2_custom_policy" {
   name = "${var.prefix}-emr-ec2-custom-policy"
   role = aws_iam_role.emr_ec2_role.id
   policy = jsonencode({
-    Version = "2012-10-17"
+    Version = "2012-10-17",
     Statement = [
       {
-        Effect = "Allow"
+        Effect = "Allow",
         Action = [
-          "ec2:Describe*",
-          "s3:*",
-          "cloudwatch:*",
-          "elasticmapreduce:*",
-          "glue:*"
-        ]
+          "ec2:Describe*", 
+          "s3:*", 
+          "cloudwatch:*", 
+          "elasticmapreduce:*", 
+          "glue:*",
+          "ssm:UpdateInstanceInformation",
+          "ssm:SendCommand",
+          "ssm:ListCommands",
+          "ssm:ListCommandInvocations",
+          "ssm:DescribeInstanceInformation",
+          "ssm:GetCommandInvocation",
+          "ssm:DescribeInstanceProperties",
+          "ssm:ListAssociations",
+          "ssm:ListInstanceAssociations"
+        ],
         Resource = "*"
       }
     ]
@@ -251,29 +460,22 @@ resource "aws_iam_instance_profile" "emr_ec2_profile" {
 resource "aws_iam_role" "cross_account_role" {
   name = "${var.prefix}-crossaccount"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
+    Version = "2012-10-17",
     Statement = [
       {
-        Effect = "Allow"
+        Effect = "Allow",
         Principal = {
           AWS = [
             "arn:aws:iam::${var.databricks_uc_aws_account_id}:root"
             ,"arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.prefix}-crossaccount"
           ]
-        }
-        Action = "sts:AssumeRole"
-        Condition = {
-          StringEquals = { "sts:ExternalId" = var.databricks_account_id }
-        }
+        },
+        Action = "sts:AssumeRole",
+        Condition = { StringEquals = { "sts:ExternalId" = var.databricks_account_id } }
       },
       {
-        Effect = "Allow"
-        Principal = {
-          Service = [
-            "lakeformation.amazonaws.com",
-            "glue.amazonaws.com"
-          ]
-        }
+        Effect = "Allow",
+        Principal = { Service = ["lakeformation.amazonaws.com", "glue.amazonaws.com"] },
         Action = "sts:AssumeRole"
       }
     ]
@@ -284,38 +486,28 @@ resource "aws_iam_role_policy" "cross_account_policy" {
   name = "${var.prefix}-policy"
   role = aws_iam_role.cross_account_role.id
   policy = jsonencode({
-    Version = "2012-10-17"
+    Version = "2012-10-17",
     Statement = [
       {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:ListBucket"
-        ]
+        Effect = "Allow",
+        Action = ["s3:GetObject", "s3:ListBucket"],
         Resource = [
           "arn:aws:s3:::aws-glue-studio-transforms-244479516193-prod-${var.region}",
           "arn:aws:s3:::aws-glue-studio-transforms-244479516193-prod-${var.region}/*"
         ]
       },
       {
-        Effect = "Allow"
-        Action = [
-          "s3:ListBucket",
-          "s3:GetBucketLocation"
-        ]
+        Effect = "Allow",
+        Action = ["s3:ListBucket", "s3:GetBucketLocation"],
         Resource = ["arn:aws:s3:::${aws_s3_bucket.root_storage_bucket.bucket}"]
       },
       {
-        Effect = "Allow"
-        Action = [
-          "s3:PutObject",
-          "s3:GetObject",
-          "s3:DeleteObject"
-        ]
+        Effect = "Allow",
+        Action = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
         Resource = ["arn:aws:s3:::${aws_s3_bucket.root_storage_bucket.bucket}/*"]
       },
       {
-        Effect = "Allow"
+        Effect = "Allow",
         Action = [
           "glue:GetDatabase",
           "glue:GetDatabases",
@@ -326,7 +518,7 @@ resource "aws_iam_role_policy" "cross_account_policy" {
           "glue:GetUserDefinedFunction",
           "glue:GetUserDefinedFunctions",
           "glue:BatchGetPartition"
-        ]
+        ],
         Resource = [
           "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:catalog",
           "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:database/*",
@@ -334,18 +526,15 @@ resource "aws_iam_role_policy" "cross_account_policy" {
         ]
       },
       {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:ListBucket"
-        ]
+        Effect = "Allow",
+        Action = ["s3:GetObject", "s3:ListBucket"],
         Resource = [
           "arn:aws:s3:::${aws_s3_bucket.root_storage_bucket.bucket}",
           "arn:aws:s3:::${aws_s3_bucket.root_storage_bucket.bucket}/*"
         ]
       },
       {
-        Effect = "Allow"
+        Effect = "Allow",
         Action = [
           "ec2:*",
           "iam:PassRole",
@@ -412,16 +601,12 @@ resource "aws_iam_role_policy" "cross_account_policy" {
           "ec2:DescribeVpcEndpoints",
           "ec2:DescribeVpcEndpointServices",
           "ec2:DescribeVpcPeeringConnections"
-        ]
+        ],
         Resource = "*"
       },
       {
-        Effect = "Allow"
-        Action = [
-          "iam:PassRole",
-          "iam:GetRole",
-          "iam:CreateServiceLinkedRole"
-        ]
+        Effect = "Allow",
+        Action = ["iam:PassRole", "iam:GetRole", "iam:CreateServiceLinkedRole"],
         Resource = "*"
       }
     ]
@@ -529,12 +714,17 @@ resource "databricks_external_location" "schema_location" {
 }
 
 resource "databricks_schema" "default_schema" {
-  provider     = databricks.workspace
-  name         = "default"
-  catalog_name = databricks_catalog.catalog.name
-  storage_root = databricks_external_location.schema_location.url
+  provider      = databricks.workspace
+  name          = "default"
+  catalog_name  = databricks_catalog.catalog.name
+  storage_root  = databricks_external_location.schema_location.url
   force_destroy = true
-  depends_on   = [databricks_external_location.schema_location]
+  depends_on    = [databricks_external_location.schema_location]
+}
+
+data "databricks_service_principal" "emr_sp" {
+  provider = databricks.account
+  application_id = var.client_id
 }
 
 resource "databricks_grants" "catalog_grants" {
@@ -545,8 +735,8 @@ resource "databricks_grants" "catalog_grants" {
     privileges = ["MANAGE", "USE_CATALOG", "CREATE_SCHEMA", "ALL_PRIVILEGES", "EXTERNAL_USE_SCHEMA"]
   }
   grant {
-    principal  = "account users"
-    privileges = ["USE_CATALOG", "CREATE_SCHEMA"]
+    principal  = data.databricks_service_principal.emr_sp.application_id
+    privileges = ["MANAGE", "USE_CATALOG", "CREATE_SCHEMA", "ALL_PRIVILEGES", "EXTERNAL_USE_SCHEMA"]
   }
   depends_on = [databricks_catalog.catalog]
 }
@@ -559,8 +749,8 @@ resource "databricks_grants" "schema_grants" {
     privileges = ["MANAGE", "CREATE_TABLE", "USE_SCHEMA", "ALL_PRIVILEGES", "EXTERNAL_USE_SCHEMA"]
   }
   grant {
-    principal  = "account users"
-    privileges = ["USE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"]
+    principal  = data.databricks_service_principal.emr_sp.application_id
+    privileges = ["MANAGE", "CREATE_TABLE", "USE_SCHEMA", "ALL_PRIVILEGES", "EXTERNAL_USE_SCHEMA"]
   }
   depends_on = [databricks_schema.default_schema]
 }
@@ -569,54 +759,95 @@ resource "aws_emr_cluster" "spark_unity_catalog" {
   name          = "${var.prefix}-emr-spark-uc"
   release_label = var.release_label
   applications  = var.applications
-
+  
   ec2_attributes {
     key_name                          = "${var.prefix}_key"
-    subnet_id                         = aws_subnet.emr.id
+    subnet_id                        = aws_subnet.emr.id
     emr_managed_master_security_group = aws_security_group.emr.id
     emr_managed_slave_security_group  = aws_security_group.emr.id
-    instance_profile                  = aws_iam_instance_profile.emr_ec2_profile.name
+    instance_profile                 = aws_iam_instance_profile.emr_ec2_profile.name
   }
-
+  
   service_role = aws_iam_role.emr_service_role.name
   log_uri      = "s3://${aws_s3_bucket.root_storage_bucket.bucket}/emr-logs/"
-
+  
   master_instance_group {
     instance_type  = "m5.xlarge"
     instance_count = 1
   }
-
+  
   core_instance_group {
     instance_type  = "m5.xlarge"
     instance_count = 2
   }
-
+  
   configurations_json = jsonencode([
     {
-      Classification = "iceberg-defaults"
+      Classification = "iceberg-defaults",
       Properties = {
         "iceberg.enabled" = "true"
       }
     },
     {
-      Classification = "spark-defaults"
+      Classification = "spark-defaults",
       Properties = {
-        "spark.sql.catalog.${var.prefix}_catalog"          = "org.apache.iceberg.spark.SparkCatalog"
-        "spark.sql.catalog.${var.prefix}_catalog.type"     = "rest"
-        "spark.sql.catalog.${var.prefix}_catalog.rest.auth.type" = "oauth2"
-        "spark.sql.catalog.${var.prefix}_catalog.uri"      = "${databricks_mws_workspaces.workspace.workspace_url}/api/2.1/unity-catalog/iceberg-rest"
-        "spark.sql.catalog.${var.prefix}_catalog.oauth2-server-uri" = "${databricks_mws_workspaces.workspace.workspace_url}/oidc/v1/token"
-        "spark.sql.catalog.${var.prefix}_catalog.credential" = "${var.client_id}:${var.client_secret}"
-        "spark.sql.catalog.${var.prefix}_catalog.warehouse" = "${var.prefix}_catalog"
-        "spark.sql.catalog.${var.prefix}_catalog.scope"    = "all-apis"
-        "spark.sql.defaultCatalog"                         = "${var.prefix}_catalog"
-        "spark.sql.extensions"                             = "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
-        "spark.sql.shuffle.partitions"                     = "1"
-        "spark.default.parallelism"                        = "1"
+        "spark.sql.catalog.${var.prefix}_catalog"                            = "org.apache.iceberg.spark.SparkCatalog",
+        "spark.sql.catalog.${var.prefix}_catalog.type"                       = "rest",
+        "spark.sql.catalog.${var.prefix}_catalog.rest.auth.type"             = "oauth2",
+        "spark.sql.catalog.${var.prefix}_catalog.uri"                        = "${databricks_mws_workspaces.workspace.workspace_url}/api/2.1/unity-catalog/iceberg-rest",
+        "spark.sql.catalog.${var.prefix}_catalog.oauth2-server-uri"          = "${databricks_mws_workspaces.workspace.workspace_url}/oidc/v1/token",
+        "spark.sql.catalog.${var.prefix}_catalog.credential"                 = "${var.client_id}:${var.client_secret}",
+        "spark.sql.catalog.${var.prefix}_catalog.warehouse"                  = "${var.prefix}_catalog",
+        "spark.sql.catalog.${var.prefix}_catalog.scope"                      = "all-apis",
+        "spark.sql.defaultCatalog"                                           = "${var.prefix}_catalog",
+        "spark.sql.extensions"                                                = "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        "spark.sql.shuffle.partitions"                                       = "1",
+        "spark.default.parallelism"                                          = "1"
+      }
+    },
+    {
+      Classification = "trino-connector-iceberg",
+      Properties = {
+        "connector.name"                              = "iceberg",
+        "iceberg.catalog.type"                        = "rest",
+        "iceberg.rest-catalog.uri"                    = "${databricks_mws_workspaces.workspace.workspace_url}/api/2.1/unity-catalog/iceberg-rest",
+        "iceberg.rest-catalog.warehouse"              = "${var.prefix}_catalog",
+        "iceberg.rest-catalog.security"               = "OAUTH2",
+        "iceberg.rest-catalog.oauth2.token"           = databricks_token.emr_pat.token_value,
+        "fs.native-s3.enabled"                        = "true",
+        "s3.region"                                   = var.region
       }
     }
   ])
-
-  depends_on = [aws_route.internet_access]
+  
+  depends_on = [
+    aws_route.internet_access, 
+    databricks_token.emr_pat, 
+    aws_s3_object.simple_trino_cleanup_script,
+    aws_s3_object.simple_ssm_script,
+    aws_s3_object.bootstrap_script,
+    aws_vpc_endpoint.ssm,
+    aws_vpc_endpoint.ssmmessages,
+    aws_vpc_endpoint.ec2messages
+  ]
+  
+  # Bootstrap: Configure SSM and place cleanup script on all nodes
+  bootstrap_action {
+    path = "s3://${aws_s3_bucket.root_storage_bucket.bucket}/${aws_s3_object.bootstrap_script.key}"
+    name = "configure-ssm-and-place-cleanup-script"
+  }
+  
+  # Step: Run the simple SSM script to execute cleanup on all nodes
+  step {
+    name              = "run-simple-ssm-cleanup"
+    action_on_failure = "CONTINUE"
+    hadoop_jar_step {
+      jar = "command-runner.jar"
+      args = [
+        "bash",
+        "-lc",
+        "aws s3 cp s3://${aws_s3_bucket.root_storage_bucket.bucket}/${aws_s3_object.simple_ssm_script.key} /tmp/simple_ssm.sh && chmod +x /tmp/simple_ssm.sh && bash /tmp/simple_ssm.sh"
+      ]
+    }
+  }
 }
-
